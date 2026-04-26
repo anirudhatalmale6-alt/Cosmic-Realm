@@ -20,6 +20,7 @@ const GRID_CELL = 512;
 const ATTACK_RANGE = 800;
 const FRICTION = 0.96;
 const FRICTION_REF_FPS = 60;
+const POS_VERSION_EPSILON = 0.05;
 
 // ── SERVER ENTITY TYPES ─────────────────────────────────────────────────────
 
@@ -354,71 +355,53 @@ export class GameEngine {
     this.tickCount++;
     const now = Date.now();
     const events: GameEvent[] = [];
+    const deltas = new Map<number, DeltaPayload>();
+    const snapshots = new Map<number, SnapshotPayload>();
+
+    const shouldDelta = now - this.lastDeltaAt >= 1000 / DELTA_RATE;
+    const shouldSnapshot = now - this.lastSnapshotAt >= 1000 / SNAPSHOT_RATE;
+    if (shouldDelta) this.lastDeltaAt = now;
+    if (shouldSnapshot) this.lastSnapshotAt = now;
 
     for (const [zoneId, zs] of this.zones) {
       const players = getPlayersInZone(zoneId);
-      if (players.length === 0 && zs.enemies.size === 0 && zs.npcShips.size === 0) continue;
 
-      // 1. Process player inputs
+      if (players.length === 0) {
+        if (zs.bossActive) {
+          for (const [id, e] of zs.enemies) if (e.isBoss) zs.enemies.delete(id);
+          zs.bossActive = false;
+          zs.bossTimer = randRange(180, 420);
+        }
+        continue;
+      }
+
       this.tickPlayerInputs(players);
-
-      // 2. Move players
       this.tickPlayerMovement(players, dt);
-
-      // 3. Rebuild grid with all entities
       this.rebuildGrid(zs, players);
-
-      // 4. Player combat (laser/rocket fire rates)
-      if (players.length > 0) {
-        this.tickPlayerCombat(zoneId, zs, players, dt, events);
-        this.tickPlayerMining(zoneId, zs, players, dt, events);
-      }
-
-      // 5. Shield regen
+      this.tickPlayerCombat(zoneId, zs, players, dt, events);
+      this.tickPlayerMining(zoneId, zs, players, dt, events);
       this.tickShieldRegen(players, dt);
-
-      // 6. Enemy spawning, AI, boss
-      if (players.length > 0) {
-        this.tickEnemySpawns(zoneId, zs, players, dt, events);
-        this.tickBossSpawn(zoneId, zs, players, dt, events);
-        this.tickNpcSpawns(zoneId, zs, dt, events);
-      }
+      this.tickEnemySpawns(zoneId, zs, players, dt, events);
+      this.tickBossSpawn(zoneId, zs, players, dt, events);
+      this.tickNpcSpawns(zoneId, zs, dt, events);
       this.tickEnemyAI(zoneId, zs, players, dt, events);
       this.tickNpcAI(zoneId, zs, dt, events);
       this.tickAsteroidRespawn(zoneId, zs, dt, events);
 
-      // 7. Decay combos
       for (const e of zs.enemies.values()) {
         for (const [pid, combo] of e.combo) {
           combo.ttl -= dt;
           if (combo.ttl <= 0) e.combo.delete(pid);
         }
       }
-    }
 
-    // Generate deltas/snapshots
-    const deltas = new Map<number, DeltaPayload>();
-    const snapshots = new Map<number, SnapshotPayload>();
-
-    const shouldDelta = now - this.lastDeltaAt >= 1000 / DELTA_RATE;
-    const shouldSnapshot = now - this.lastSnapshotAt >= 1000 / SNAPSHOT_RATE;
-
-    if (shouldDelta) {
-      this.lastDeltaAt = now;
-      for (const [zoneId, zs] of this.zones) {
-        const players = getPlayersInZone(zoneId);
-        for (const p of players) {
-          deltas.set(p.playerId, this.buildDelta(p, zoneId, zs, players));
-        }
-      }
-    }
-
-    if (shouldSnapshot) {
-      this.lastSnapshotAt = now;
-      for (const [zoneId, zs] of this.zones) {
-        const players = getPlayersInZone(zoneId);
+      if (shouldSnapshot) {
         for (const p of players) {
           snapshots.set(p.playerId, this.buildSnapshot(p, zoneId, zs, players));
+        }
+      } else if (shouldDelta) {
+        for (const p of players) {
+          deltas.set(p.playerId, this.buildDelta(p, zoneId, zs, players));
         }
       }
     }
@@ -490,7 +473,7 @@ export class GameEngine {
       p.posX = clamp(p.posX, -MAP_RADIUS, MAP_RADIUS);
       p.posY = clamp(p.posY, -MAP_RADIUS, MAP_RADIUS);
 
-      if (p.posX !== oldX || p.posY !== oldY) p.version++;
+      if (Math.abs(p.posX - oldX) > POS_VERSION_EPSILON || Math.abs(p.posY - oldY) > POS_VERSION_EPSILON) p.version++;
     }
   }
 
@@ -602,7 +585,8 @@ export class GameEngine {
     if (enemy.hull <= 0) {
       const tierMult = this.getZoneTierMult(zoneId);
       const pData = this.playerDataCache.get(attackerId);
-      const lootBon = pData ? computeStats(pData).lootBonus : 0;
+      const stats = pData ? computeStats(pData) : null;
+      const lootBon = stats?.lootBonus ?? 0;
       const loot: LootDrop = {
         credits: Math.round(enemy.credits * tierMult) + Math.round(lootBon * 2),
         exp: Math.round(enemy.exp * tierMult * (enemy.isBoss ? 2 : 1)),
@@ -617,8 +601,7 @@ export class GameEngine {
       }
 
       // AOE splash
-      if (pData) {
-        const stats = computeStats(pData);
+      if (stats) {
         if (stats.aoeRadius > 0) {
           const splashRange = stats.aoeRadius * 8;
           const splashDmg = Math.round(dmg * 0.4);
