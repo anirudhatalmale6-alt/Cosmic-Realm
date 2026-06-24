@@ -13,7 +13,7 @@ import {
   rankFor,
 } from "./types";
 import { sfx } from "./sound";
-import { type ServerEnemy, type ServerAsteroid, type ServerNpc, type EnemyHitEvent, type EnemyDieEvent, type EnemyAttackEvent, type DeltaPayload, type SnapshotPayload, type WelcomePayload, type DeltaEntity, type LaserFireEvent, type RocketFireEvent } from "../net/socket";
+import { type ServerEnemy, type ServerAsteroid, type ServerNpc, type EnemyHitEvent, type EnemyDieEvent, type EnemyAttackEvent, type DeltaPayload, type SnapshotPayload, type WelcomePayload, type DeltaEntity, type LaserFireEvent, type RocketFireEvent, type ProjectileSpawnEvent } from "../net/socket";
 
 // Returns the equipped weapon's color (used for laser projectiles)
 function equippedWeaponColor(): string {
@@ -561,7 +561,7 @@ function emitDeath(x: number, y: number, color: string, big = false): void {
 function fireProjectile(
   from: "player" | "enemy" | "drone",
   x: number, y: number, angle: number, damage: number, color: string, size = 3,
-  opts?: { crit?: boolean; aoeRadius?: number; speedMul?: number; homing?: boolean; empStun?: number; armorPiercing?: boolean; weaponKind?: WeaponKind },
+  opts?: { crit?: boolean; aoeRadius?: number; speedMul?: number; homing?: boolean; empStun?: number; armorPiercing?: boolean; weaponKind?: WeaponKind; renderOnly?: boolean },
 ): void {
   const speedBase = from === "player" ? 280 : from === "drone" ? 260 : 220;
   const speed = speedBase * (opts?.speedMul ?? 1);
@@ -580,6 +580,7 @@ function fireProjectile(
     empStun: opts?.empStun,
     armorPiercing: opts?.armorPiercing,
     weaponKind: opts?.weaponKind,
+    renderOnly: opts?.renderOnly,
   });
 }
 
@@ -824,6 +825,8 @@ function tickWorld(dt: number): void {
     if (state.combatLaserFlash.ttl <= 0) state.combatLaserFlash = null;
   }
 
+  if (serverAuthoritative) applyServerSmoothing(dt);
+
   // ── Respawn timer: fire actual respawn logic after explosion delay ────
   if (state.playerRespawnTimer > 0) {
     state.playerRespawnTimer -= dt;
@@ -930,16 +933,13 @@ function tickWorld(dt: number): void {
     p.pos.x += p.vel.x * dt;
     p.pos.y += p.vel.y * dt;
   } else {
-    // Smooth pursuit: advance server target with velocity, then smoothly track it
-    _srvX += _srvVX * dt;
-    _srvY += _srvVY * dt;
-    const smoothRate = Math.min(1, 20 * dt);
-    p.pos.x += (_srvX - p.pos.x) * smoothRate;
-    p.pos.y += (_srvY - p.pos.y) * smoothRate;
-    p.vel.x = _srvVX;
-    p.vel.y = _srvVY;
-    if (Math.abs(_srvVX) > 1 || Math.abs(_srvVY) > 1) {
-      p.angle = Math.atan2(_srvVY, _srvVX);
+    // Server owns position; extrapolate linearly with server velocity between delta snaps
+    // No friction here - server velocity is post-friction and represents the right speed
+    // Applying friction client-side causes undershoot then snap-forward on each delta
+    p.pos.x += p.vel.x * dt;
+    p.pos.y += p.vel.y * dt;
+    if (Math.abs(p.vel.x) > 1 || Math.abs(p.vel.y) > 1) {
+      p.angle = Math.atan2(p.vel.y, p.vel.x);
     }
   }
   // Face attack target when fighting (DarkOrbit style)
@@ -1463,6 +1463,9 @@ function tickWorld(dt: number): void {
       if (isEmp && Math.random() < 0.08) {
         emitRing(pr.pos.x, pr.pos.y, pr.color);
       }
+    }
+    if (pr.renderOnly) {
+      return true;
     }
     if (pr.fromPlayer) {
       // hit enemies
@@ -2079,6 +2082,21 @@ export function onRocketFireFromServer(data: RocketFireEvent): void {
   }
 }
 
+export function onProjectileSpawnFromServer(data: ProjectileSpawnEvent): void {
+  const angle = Math.atan2(data.vy, data.vx);
+  const speed = Math.sqrt(data.vx * data.vx + data.vy * data.vy);
+  const baseSpeed = data.fromPlayer ? 280 : 220;
+  const speedMul = baseSpeed > 0 ? speed / baseSpeed : 1;
+
+  fireProjectile(data.fromPlayer ? "player" : "enemy", data.x, data.y, angle, data.damage, data.color, data.size, {
+    crit: data.crit,
+    homing: data.homing,
+    speedMul,
+    weaponKind: data.weaponKind,
+    renderOnly: true,
+  });
+}
+
 function serverEnemyToLocal(se: ServerEnemy): Enemy {
   return {
     id: se.id,
@@ -2106,7 +2124,75 @@ let serverConfig = { tickRate: 25, friction: 0.96, frictionRefFps: 60 };
 export let serverAuthoritative = false;
 let serverPlayerId = 0;
 let _deltaCount = 0;
-let _srvX = 0, _srvY = 0, _srvVX = 0, _srvVY = 0;
+
+const SELF_LERP_RATE = 18;
+const ENTITY_LERP_RATE = 14;
+const SELF_SNAP_DIST_SQ = 250 * 250;
+
+type RenderTarget = { x: number; y: number; vx: number; vy: number };
+const _selfTarget: RenderTarget & { set: boolean } = { x: 0, y: 0, vx: 0, vy: 0, set: false };
+const _entityTargets = new Map<string, RenderTarget>();
+
+function setSelfTarget(x: number, y: number, vx: number, vy: number): void {
+  if (!_selfTarget.set) {
+    state.player.pos.x = x;
+    state.player.pos.y = y;
+    _selfTarget.set = true;
+  }
+  _selfTarget.x = x;
+  _selfTarget.y = y;
+  _selfTarget.vx = vx;
+  _selfTarget.vy = vy;
+}
+
+function setEntityTarget(id: string, x: number, y: number, vx: number, vy: number): void {
+  const cur = _entityTargets.get(id);
+  if (cur) { cur.x = x; cur.y = y; cur.vx = vx; cur.vy = vy; }
+  else _entityTargets.set(id, { x, y, vx, vy });
+}
+
+function applyServerSmoothing(dt: number): void {
+  if (_selfTarget.set) {
+    const p = state.player;
+    const dx = _selfTarget.x - p.pos.x;
+    const dy = _selfTarget.y - p.pos.y;
+    if (dx * dx + dy * dy > SELF_SNAP_DIST_SQ) {
+      p.pos.x = _selfTarget.x;
+      p.pos.y = _selfTarget.y;
+    } else {
+      const t = Math.min(1, SELF_LERP_RATE * dt);
+      p.pos.x += dx * t;
+      p.pos.y += dy * t;
+    }
+    p.vel.x = _selfTarget.vx;
+    p.vel.y = _selfTarget.vy;
+  }
+  const t = Math.min(1, ENTITY_LERP_RATE * dt);
+  for (const o of state.others) {
+    const tgt = _entityTargets.get(`p-${o.id}`);
+    if (!tgt) continue;
+    o.pos.x += (tgt.x - o.pos.x) * t;
+    o.pos.y += (tgt.y - o.pos.y) * t;
+    o.vel.x = tgt.vx;
+    o.vel.y = tgt.vy;
+  }
+  for (const e of state.enemies) {
+    const tgt = _entityTargets.get(e.id);
+    if (!tgt) continue;
+    e.pos.x += (tgt.x - e.pos.x) * t;
+    e.pos.y += (tgt.y - e.pos.y) * t;
+    e.vel.x = tgt.vx;
+    e.vel.y = tgt.vy;
+  }
+  for (const n of state.npcShips) {
+    const tgt = _entityTargets.get(n.id);
+    if (!tgt) continue;
+    n.pos.x += (tgt.x - n.pos.x) * t;
+    n.pos.y += (tgt.y - n.pos.y) * t;
+    n.vel.x = tgt.vx;
+    n.vel.y = tgt.vy;
+  }
+}
 
 export function onWelcome(data: WelcomePayload): void {
   serverConfig = {
@@ -2127,34 +2213,20 @@ export function onDelta(data: DeltaPayload): void {
   const p = state.player;
   const self = data.self;
 
-  // Set server target for smooth pursuit (game loop smoothly converges toward it)
-  _srvX = self.x;
-  _srvY = self.y;
-  _srvVX = self.vx;
-  _srvVY = self.vy;
+  setSelfTarget(self.x, self.y, self.vx, self.vy);
 
-  // Snap on first delta or if very far (teleport/warp)
-  const dx = self.x - p.pos.x;
-  const dy = self.y - p.pos.y;
-  if (_deltaCount <= 1 || (dx * dx + dy * dy) > 40000) {
-    p.pos.x = self.x;
-    p.pos.y = self.y;
-  }
-
-  // Sync HP/shield from server (authoritative)
   if (state.playerRespawnTimer <= 0) {
     p.hull = self.hp;
     p.shield = self.shield;
   }
 
-  // Process addOrUpdate
   for (const entity of data.addOrUpdate) {
     applyEntityUpdate(entity);
   }
 
-  // Process removals
   for (const id of data.removals) {
     removeEntityById(id);
+    _entityTargets.delete(id);
   }
 }
 
@@ -2163,29 +2235,25 @@ export function onSnapshot(data: SnapshotPayload): void {
   const p = state.player;
   const self = data.self;
 
-  // Update server target for smooth pursuit
-  _srvX = self.x;
-  _srvY = self.y;
-  _srvVX = self.vx;
-  _srvVY = self.vy;
-  p.pos.x = self.x;
-  p.pos.y = self.y;
+  setSelfTarget(self.x, self.y, self.vx, self.vy);
   if (state.playerRespawnTimer <= 0) {
     p.hull = self.hp;
     p.shield = self.shield;
   }
 
-  // Apply all entities
   const entityIds = new Set<string>();
   for (const entity of data.entities) {
     entityIds.add(entity.id);
     applyEntityUpdate(entity);
   }
 
-  // Remove entities not in snapshot (they left our viewport)
   state.enemies = state.enemies.filter(e => entityIds.has(e.id));
   state.npcShips = state.npcShips.filter(n => entityIds.has(n.id));
   state.others = state.others.filter(o => entityIds.has(`p-${o.id}`));
+
+  for (const id of Array.from(_entityTargets.keys())) {
+    if (!entityIds.has(id)) _entityTargets.delete(id);
+  }
 
   bump();
 }
@@ -2193,29 +2261,30 @@ export function onSnapshot(data: SnapshotPayload): void {
 export function onPlayerHitFromServer(data: { damage: number; hp: number; shield: number }): void {
   const p = state.player;
   if (state.playerRespawnTimer > 0) return;
-
-  // Set authoritative HP from server
   p.hull = data.hp;
   p.shield = data.shield;
-
-  // Visual feedback
   emitSpark(p.pos.x, p.pos.y, "#ff5c6c", 6, 70, 2);
   sfx.hit();
   state.cameraShake = Math.max(state.cameraShake, 0.15);
   state.lastHitTick = state.tick;
+}
 
-  if (p.hull <= 0 && state.playerRespawnTimer <= 0) {
-    const shipColor = SHIP_CLASSES[p.shipClass].color;
-    emitDeath(p.pos.x, p.pos.y, shipColor, true);
-    state.playerDeathFlash = 0.6;
-    state.playerRespawnTimer = 0.5;
-    p.hull = 1;
-    p.vel = { x: 0, y: 0 };
-    state.player.milestones.totalDeaths++;
-    sfx.thrusterStop();
-    sfx.explosion(true);
-    state.cameraShake = 1;
-  }
+export function onPlayerDieFromServer(data: { playerId: number; pos: { x: number; y: number } }): void {
+  const p = state.player;
+  if (data.playerId !== serverPlayerId) return;
+  const shipColor = SHIP_CLASSES[p.shipClass].color;
+  emitDeath(data.pos.x, data.pos.y, shipColor, true);
+  state.playerDeathFlash = 0.6;
+  state.player.milestones.totalDeaths++;
+  state.isAttacking = false;
+  state.isLaserFiring = false;
+  state.isRocketFiring = false;
+  state.attackTargetId = null;
+  state.selectedWorldTarget = null;
+  sfx.thrusterStop();
+  sfx.explosion(true);
+  state.cameraShake = 1;
+  pushNotification("Ship destroyed. Respawning...", "bad");
 }
 
 function applyEntityUpdate(entity: DeltaEntity): void {
@@ -2223,17 +2292,14 @@ function applyEntityUpdate(entity: DeltaEntity): void {
     case "enemy": {
       const e = state.enemies.find(en => en.id === entity.id);
       if (e) {
-        // Compute velocity to smoothly converge to server position
-        const edx = entity.x - e.pos.x;
-        const edy = entity.y - e.pos.y;
-        e.vel.x = (entity.vx || 0) + edx * 8;
-        e.vel.y = (entity.vy || 0) + edy * 8;
+        setEntityTarget(entity.id, entity.x, entity.y, entity.vx ?? 0, entity.vy ?? 0);
         if (entity.angle != null) e.angle = entity.angle;
         if (entity.hp != null) e.hull = entity.hp;
         if (entity.hpMax != null) e.hullMax = entity.hpMax;
         if (entity.isBoss != null) e.isBoss = entity.isBoss;
         if (entity.bossPhase != null) e.bossPhase = entity.bossPhase;
       } else {
+        setEntityTarget(entity.id, entity.x, entity.y, entity.vx ?? 0, entity.vy ?? 0);
         state.enemies.push({
           id: entity.id,
           type: (entity.type || "scout") as EnemyType,
@@ -2258,12 +2324,10 @@ function applyEntityUpdate(entity: DeltaEntity): void {
       const numId = entity.id.replace("p-", "");
       const o = state.others.find(op => op.id === numId);
       if (o) {
-        const odx = entity.x - o.pos.x;
-        const ody = entity.y - o.pos.y;
-        o.vel.x = (entity.vx || 0) + odx * 8;
-        o.vel.y = (entity.vy || 0) + ody * 8;
+        setEntityTarget(entity.id, entity.x, entity.y, entity.vx ?? 0, entity.vy ?? 0);
         if (entity.angle != null) o.angle = entity.angle;
       } else {
+        setEntityTarget(entity.id, entity.x, entity.y, entity.vx ?? 0, entity.vy ?? 0);
         state.others.push({
           id: numId,
           name: entity.name || "Pilot",
@@ -2282,15 +2346,13 @@ function applyEntityUpdate(entity: DeltaEntity): void {
     case "npc": {
       const n = state.npcShips.find(ns => ns.id === entity.id);
       if (n) {
-        const ndx = entity.x - n.pos.x;
-        const ndy = entity.y - n.pos.y;
-        n.vel.x = (entity.vx || 0) + ndx * 8;
-        n.vel.y = (entity.vy || 0) + ndy * 8;
+        setEntityTarget(entity.id, entity.x, entity.y, entity.vx ?? 0, entity.vy ?? 0);
         if (entity.angle != null) n.angle = entity.angle;
         if (entity.hp != null) n.hull = entity.hp;
         if (entity.hpMax != null) n.hullMax = entity.hpMax;
         if (entity.state != null) n.state = entity.state as any;
       } else {
+        setEntityTarget(entity.id, entity.x, entity.y, entity.vx ?? 0, entity.vy ?? 0);
         state.npcShips.push({
           id: entity.id,
           name: entity.name || "NPC",

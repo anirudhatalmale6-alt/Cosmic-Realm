@@ -154,6 +154,20 @@ export type RocketFireEvent = {
   targetPos: { x: number; y: number };
 };
 
+export type ProjectileSpawnEvent = {
+  x: number;
+  y: number;
+  vx: number;
+  vy: number;
+  damage: number;
+  color: string;
+  size: number;
+  crit: boolean;
+  weaponKind: "laser" | "rocket";
+  homing: boolean;
+  fromPlayer: boolean;
+};
+
 type SocketEvents = {
   onWelcome: (payload: WelcomePayload) => void;
   onDelta: (payload: DeltaPayload) => void;
@@ -171,12 +185,14 @@ type SocketEvents = {
   onEnemyHit: (event: EnemyHitEvent) => void;
   onEnemyAttack: (event: EnemyAttackEvent) => void;
   onPlayerHit: (data: { damage: number; hp: number; shield: number }) => void;
+  onPlayerDie: (data: { playerId: number; pos: { x: number; y: number } }) => void;
   onAsteroidMine: (data: { asteroidId: string; hp: number; hpMax: number }) => void;
   onAsteroidDestroy: (data: { asteroidId: string; playerId: number; ore: { resourceId: string; qty: number } }) => void;
   onAsteroidRespawn: (asteroid: ServerAsteroid) => void;
   onBossWarn: () => void;
   onNpcSpawn: (npc: ServerNpc) => void;
   onNpcDie: (data: { npcId: string }) => void;
+  onProjectileSpawn: (event: ProjectileSpawnEvent) => void;
   onLaserFire: (event: LaserFireEvent) => void;
   onRocketFire: (event: RocketFireEvent) => void;
 };
@@ -270,6 +286,10 @@ export function connectSocket(token: string) {
     listeners.onPlayerHit?.(data);
   });
 
+  socket.on("player:die", (data: { playerId: number; pos: { x: number; y: number } }) => {
+    listeners.onPlayerDie?.(data);
+  });
+
   socket.on("asteroid:mine", (data: { asteroidId: string; hp: number; hpMax: number }) => {
     listeners.onAsteroidMine?.(data);
   });
@@ -292,6 +312,10 @@ export function connectSocket(token: string) {
 
   socket.on("npc:die", (data: { npcId: string }) => {
     listeners.onNpcDie?.(data);
+  });
+
+  socket.on("projectile:spawn", (event: ProjectileSpawnEvent) => {
+    listeners.onProjectileSpawn?.(event);
   });
 
   socket.on("laser:fire", (event: LaserFireEvent) => {
@@ -327,7 +351,22 @@ export function sendInput(data: {
   rocketAmmo: string;
 }): number {
   const seq = ++_inputSeq;
-  socket?.emit("input", { seq, ...data });
+  if (typeof data.targetX === "number" && Number.isFinite(data.targetX) && typeof data.targetY === "number" && Number.isFinite(data.targetY)) {
+    socket?.emit("input:move", {
+      x: data.targetX,
+      y: data.targetY,
+    });
+  }
+  socket?.emit("input:attack", {
+    enemyId: data.attackTargetId,
+    laser: data.firing,
+    rocket: data.rocketFiring,
+    laserAmmo: data.laserAmmo,
+    rocketAmmo: data.rocketAmmo,
+  });
+  socket?.emit("input:mine", {
+    asteroidId: data.miningTargetId,
+  });
   return seq;
 }
 

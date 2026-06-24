@@ -17,7 +17,7 @@ import AuthScreen from "./components/AuthScreen";
 import { hasToken, getPlayer, clearToken } from "./net/api";
 import {
   connectSocket, disconnectSocket, setSocketListeners, sendInput,
-  type ServerEnemy, type ServerAsteroid, type ServerNpc,
+  type ServerEnemy, type ServerAsteroid, type ServerNpc, type ProjectileSpawnEvent,
   type EnemyHitEvent, type EnemyDieEvent, type EnemyAttackEvent,
 } from "./net/socket";
 import {
@@ -25,8 +25,8 @@ import {
   onAsteroidMine, onAsteroidDestroy, onAsteroidRespawn,
   onServerZoneEnemies, onServerZoneAsteroids, onServerZoneNpcs,
   onNpcSpawn, onNpcDie,
-  onWelcome, onDelta, onSnapshot, onPlayerHitFromServer,
-  onLaserFireFromServer, onRocketFireFromServer,
+  onWelcome, onDelta, onSnapshot, onPlayerHitFromServer, onPlayerDieFromServer,
+  onLaserFireFromServer, onRocketFireFromServer, onProjectileSpawnFromServer,
 } from "./game/loop";
 
 function GameCanvas() {
@@ -411,22 +411,37 @@ function GameApp() {
       onEnemyHit: (event: EnemyHitEvent) => onEnemyHit(event),
       onEnemyAttack: (event: EnemyAttackEvent) => onEnemyAttack(event),
       onPlayerHit: (data) => onPlayerHitFromServer(data),
+      onPlayerDie: (data) => onPlayerDieFromServer(data),
       onAsteroidMine: (data) => onAsteroidMine(data),
       onAsteroidDestroy: (data) => onAsteroidDestroy(data),
       onAsteroidRespawn: (asteroid: ServerAsteroid) => onAsteroidRespawn(asteroid),
       onBossWarn: () => onBossWarn(),
       onNpcSpawn: (npc: ServerNpc) => onNpcSpawn(npc),
       onNpcDie: (data) => onNpcDie(data),
+      onProjectileSpawn: (event: ProjectileSpawnEvent) => onProjectileSpawnFromServer(event),
       onLaserFire: (event) => onLaserFireFromServer(event),
       onRocketFire: (event) => onRocketFireFromServer(event),
     });
     return () => setSocketListeners({});
   }, []);
 
-  // Send input to server every 50ms (unified: movement + combat + mining)
   useEffect(() => {
+    const last = {
+      targetX: Number.NaN,
+      targetY: Number.NaN,
+      firing: false,
+      rocketFiring: false,
+      attackTargetId: null as string | null,
+      miningTargetId: null as string | null,
+      laserAmmo: "",
+      rocketAmmo: "",
+      sentAt: 0,
+    };
+    const HEARTBEAT_MS = 1000;
+    const MOVE_EPSILON = 1.5;
+
     const id = setInterval(() => {
-      sendInput({
+      const cur = {
         targetX: state.cameraTarget.x,
         targetY: state.cameraTarget.y,
         firing: state.isLaserFiring,
@@ -435,7 +450,24 @@ function GameApp() {
         miningTargetId: state.miningTargetId,
         laserAmmo: state.player.activeAmmoType ?? "x1",
         rocketAmmo: state.player.activeRocketAmmoType ?? "cl1",
-      });
+      };
+      const now = performance.now();
+      const moved =
+        Math.abs(cur.targetX - last.targetX) > MOVE_EPSILON ||
+        Math.abs(cur.targetY - last.targetY) > MOVE_EPSILON;
+      const combatChanged =
+        cur.firing !== last.firing ||
+        cur.rocketFiring !== last.rocketFiring ||
+        cur.attackTargetId !== last.attackTargetId ||
+        cur.laserAmmo !== last.laserAmmo ||
+        cur.rocketAmmo !== last.rocketAmmo;
+      const miningChanged = cur.miningTargetId !== last.miningTargetId;
+      const heartbeat = now - last.sentAt > HEARTBEAT_MS;
+
+      if (!moved && !combatChanged && !miningChanged && !heartbeat) return;
+
+      sendInput(cur);
+      Object.assign(last, cur, { sentAt: now });
     }, 50);
     return () => clearInterval(id);
   }, []);
